@@ -116,6 +116,8 @@ class StockAnalyzer:
         """下載股票數據、財報、法人籌碼、融資融券、期貨借券等數據。"""
         print(f"\n----- 開始為 {self.ticker} 下載數據 (期間: {period}) -----")
         self.df = yf.download(f'{self.ticker}.TW', period=period, progress=False)
+        if self.df.empty:  # 上市抓不到時改抓上櫃
+            self.df = yf.download(f'{self.ticker}.TWO', period=period, progress=False)
         if self.df.empty:
             print(f"錯誤: 無法下載 {self.ticker}.TW 的 K 線數據。")
             return False

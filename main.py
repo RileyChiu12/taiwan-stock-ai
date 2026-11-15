@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from stock import StockAnalyzer, TaiwanMarketScanner
+from advanced import build_advanced
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -132,6 +133,8 @@ def analyze(req: AnalyzeRequest):
         # 使用 Plotly 自己的 JSON encoder，避免 NumPy / pandas / NaN / Timestamp
         # 直接交給 FastAPI JSONResponse 時造成 500 Internal Server Error。
         "plot": json.loads(plot.to_json()),
+        # 進階圖表：布林通道、ATR、三大法人、融資融券、期貨借券、季度營收毛利
+        "advanced": build_advanced(ticker, req.period),
     }
 
 
