@@ -360,14 +360,37 @@ class StockAnalyzer:
             return "Gemini API Key 未設定，無法提供 AI 盤勢分析。"
         if self.df.empty:
             return "無足夠數據進行 AI 盤勢分析。"
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.gemini_api_key)
-            model = genai.GenerativeModel('gemini-flash-latest')
-            prompt = f"請簡要分析台股 {self.ticker} 目前走勢：收盤價 {self.df['close'].iloc[-1]}，RSI {self.df['rsi'].iloc[-1]:.1f}，均線多空狀態。請給出客觀分析。"
-            return model.generate_content(prompt).text
-        except Exception as e:
-            return f"呼叫 Gemini API 發生錯誤: {e}"
+        import time
+        key = self.gemini_api_key.strip()
+        prompt = f"請簡要分析台股 {self.ticker} 目前走勢：收盤價 {self.df['close'].iloc[-1]}，RSI {self.df['rsi'].iloc[-1]:.1f}，均線多空狀態。請給出客觀分析。"
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        headers = {"x-goog-api-key": key, "Content-Type": "application/json"}
+        models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+        last_error = ""
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for attempt in range(2):
+                try:
+                    r = requests.post(url, headers=headers, json=payload, timeout=60)
+                except Exception as e:
+                    last_error = f"連線失敗: {e}"
+                    break
+                if r.status_code == 200:
+                    try:
+                        parts = r.json()["candidates"][0]["content"]["parts"]
+                        return "".join(p.get("text", "") for p in parts)
+                    except Exception:
+                        return f"Gemini 回傳格式無法解析: {r.text[:300]}"
+                last_error = f"{model} 回傳 {r.status_code}: {r.text[:300]}"
+                if r.status_code in (401, 403):
+                    return f"呼叫 Gemini API 發生錯誤（金鑰無效或無權限）: {last_error}"
+                if r.status_code in (500, 503) and attempt == 0:
+                    time.sleep(3)
+                    continue
+                break  # 429 額度用完 / 404 模型不存在 / 仍忙碌：換下一個模型
+        if "429" in last_error:
+            return "Gemini 免費額度暫時用完（每分鐘次數上限），請等 1 分鐘後再按一次分析。"
+        return f"呼叫 Gemini API 發生錯誤: {last_error}"
 
     def scan_watchlist(self, tickers_str: str):
         results = []
@@ -388,15 +411,207 @@ class StockAnalyzer:
         return pd.DataFrame(results)
 
 class TaiwanMarketScanner:
+    """全市場快照（TWSE / TPEx OpenAPI）＋ 歷史 K 線技術評分。"""
     TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     TPEx_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+    HEADERS = {"User-Agent": "Mozilla/5.0 (taiwan-stock-ai)", "Accept": "application/json"}
 
+    def __init__(self):
+        self.errors = []
+
+    # ── 工具 ──
+    @staticmethod
+    def _num(v):
+        if v is None:
+            return np.nan
+        s = str(v).replace(",", "").replace("+", "").replace("X", "").strip()
+        if s in ("", "--", "---", "----", "N/A", "除權息", "除息", "除權"):
+            return np.nan
+        try:
+            return float(s)
+        except ValueError:
+            return np.nan
+
+    @staticmethod
+    def _pick(row, *keys):
+        for k in keys:
+            if k in row and row[k] not in (None, ""):
+                return row[k]
+        return None
+
+    def _get_json(self, url):
+        try:
+            r = requests.get(url, headers=self.HEADERS, timeout=30)
+        except requests.exceptions.SSLError:
+            # 部分政府網站憑證不符合新版 Python 的嚴格檢查；公開行情資料改用不驗證憑證重試
+            import urllib3
+            urllib3.disable_warnings()
+            r = requests.get(url, headers=self.HEADERS, timeout=30, verify=False)
+        r.raise_for_status()
+        return r.json()
+
+    def _twse(self):
+        rows = []
+        for d in self._get_json(self.TWSE_URL):
+            code = str(self._pick(d, "Code", "證券代號") or "").strip()
+            rows.append({
+                "代號": code,
+                "名稱": str(self._pick(d, "Name", "證券名稱") or "").strip(),
+                "市場": "上市",
+                "收盤": self._num(self._pick(d, "ClosingPrice", "收盤價")),
+                "漲跌": self._num(self._pick(d, "Change", "漲跌價差")),
+                "成交量(股)": self._num(self._pick(d, "TradeVolume", "成交股數")),
+                "成交金額(元)": self._num(self._pick(d, "TradeValue", "成交金額")),
+            })
+        return rows
+
+    def _tpex(self):
+        rows = []
+        for d in self._get_json(self.TPEx_URL):
+            code = str(self._pick(d, "SecuritiesCompanyCode", "Code", "代號") or "").strip()
+            rows.append({
+                "代號": code,
+                "名稱": str(self._pick(d, "CompanyName", "Name", "名稱") or "").strip(),
+                "市場": "上櫃",
+                "收盤": self._num(self._pick(d, "Close", "ClosingPrice", "收盤")),
+                "漲跌": self._num(self._pick(d, "Change", "漲跌")),
+                "成交量(股)": self._num(self._pick(d, "TradingShares", "TradeVolume", "成交股數")),
+                "成交金額(元)": self._num(self._pick(d, "TransactionAmount", "TradeValue", "成交金額(元)", "成交金額")),
+            })
+        return rows
+
+    # ── 市場快照 ──
     def get_market_snapshot(self, market="上市＋上櫃"):
-        # 實作市場快照
-        return pd.DataFrame()
+        self.errors = []
+        rows = []
+        if "上市" in market:
+            try:
+                rows += self._twse()
+            except Exception as e:
+                self.errors.append(f"上市資料取得失敗：{e}")
+        if "上櫃" in market:
+            try:
+                rows += self._tpex()
+            except Exception as e:
+                self.errors.append(f"上櫃資料取得失敗：{e}")
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        # 只保留 4 碼普通股（排除 ETF、權證、特別股等）
+        df = df[df["代號"].str.fullmatch(r"[1-9]\d{3}")]
+        df = df.dropna(subset=["收盤"])
+        df = df[df["收盤"] > 0]
+        prev = df["收盤"] - df["漲跌"]
+        df["漲跌幅(%)"] = np.where(prev > 0, df["漲跌"] / prev * 100, np.nan)
+        df["成交金額(億)"] = df["成交金額(元)"] / 1e8
+        return df.reset_index(drop=True)
 
+    def _status_suffix(self):
+        return ("　⚠️ " + "；".join(self.errors)) if self.errors else ""
+
+    # ── 漲幅排行 ──
     def get_top_gainers(self, market="上市＋上櫃", top_n=100, min_trade_value=0):
-        return pd.DataFrame(), "完成漲幅排行查詢。"
+        df = self.get_market_snapshot(market)
+        if df.empty:
+            return pd.DataFrame(), "無法取得市場資料。" + self._status_suffix()
+        df = df.dropna(subset=["漲跌幅(%)"])
+        if min_trade_value and min_trade_value > 0:
+            # 前端輸入單位視為「億元」
+            df = df[df["成交金額(億)"] >= float(min_trade_value)]
+        df = df.sort_values("漲跌幅(%)", ascending=False).head(int(top_n))
+        out = df[["代號", "名稱", "市場", "收盤", "漲跌", "漲跌幅(%)", "成交金額(億)"]].copy()
+        out["漲跌幅(%)"] = out["漲跌幅(%)"].round(2)
+        out["成交金額(億)"] = out["成交金額(億)"].round(2)
+        out.insert(0, "排名", range(1, len(out) + 1))
+        return out.reset_index(drop=True), f"完成漲幅排行：共 {len(out)} 檔（{market}，最新交易日收盤資料）。" + self._status_suffix()
+
+    # ── 技術評分 ──
+    @staticmethod
+    def _score_one(d):
+        d = d.dropna(subset=["Close"])
+        if len(d) < 60:
+            return None
+        c, v = d["Close"], d["Volume"]
+        ma5, ma20, ma60 = c.rolling(5).mean(), c.rolling(20).mean(), c.rolling(60).mean()
+        delta = c.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        rsi = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+        ema12, ema26 = c.ewm(span=12, adjust=False).mean(), c.ewm(span=26, adjust=False).mean()
+        dif = ema12 - ema26
+        hist = dif - dif.ewm(span=9, adjust=False).mean()
+        last = c.iloc[-1]
+        r = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+        ret20 = (last / c.iloc[-21] - 1) * 100 if len(c) > 21 else 0.0
+        vol_ratio = v.iloc[-1] / v.iloc[-21:-1].mean() if v.iloc[-21:-1].mean() > 0 else 0.0
+
+        score, reasons = 0, []
+        if last > ma20.iloc[-1]:
+            score += 20; reasons.append("站上月線")
+        if ma20.iloc[-1] > ma60.iloc[-1]:
+            score += 15; reasons.append("月線>季線")
+        if ma5.iloc[-1] > ma20.iloc[-1]:
+            score += 10; reasons.append("短均多排")
+        if 50 <= r <= 75:
+            score += 15; reasons.append("RSI 強勢區")
+        elif r > 75:
+            score += 5; reasons.append("RSI 過熱")
+        if hist.iloc[-1] > 0:
+            score += 10; reasons.append("MACD 柱>0")
+        if hist.iloc[-1] > hist.iloc[-2]:
+            score += 5; reasons.append("MACD 柱放大")
+        if vol_ratio >= 1.5:
+            score += 10; reasons.append("量增")
+        elif vol_ratio >= 1.0:
+            score += 5
+        if ret20 > 0:
+            score += 10; reasons.append("20日報酬為正")
+        if last >= c.iloc[-60:].max() * 0.97:
+            score += 5; reasons.append("接近60日高")
+        return {
+            "技術分數": score,
+            "RSI(14)": round(r, 1),
+            "20日報酬(%)": round(float(ret20), 2),
+            "量比": round(float(vol_ratio), 2),
+            "月線乖離(%)": round(float((last / ma20.iloc[-1] - 1) * 100), 2),
+            "訊號": "、".join(reasons),
+        }
 
     def scan(self, market="上市＋上櫃", candidate_count=60, min_score=60):
-        return pd.DataFrame(), "完成全市場選股掃描。"
+        snap = self.get_market_snapshot(market)
+        if snap.empty:
+            return pd.DataFrame(), "無法取得市場資料。" + self._status_suffix()
+        # 候選池：成交金額前 N 大（流動性最好的股票）
+        cand = snap.sort_values("成交金額(元)", ascending=False).head(int(candidate_count))
+        sym_map = {f"{r['代號']}{'.TW' if r['市場'] == '上市' else '.TWO'}": r for _, r in cand.iterrows()}
+        try:
+            hist = yf.download(list(sym_map), period="6mo", interval="1d", group_by="ticker",
+                               auto_adjust=True, progress=False, threads=True)
+        except Exception as e:
+            return pd.DataFrame(), f"歷史 K 線下載失敗：{e}" + self._status_suffix()
+
+        rows = []
+        for sym, info in sym_map.items():
+            try:
+                d = hist[sym] if isinstance(hist.columns, pd.MultiIndex) else hist
+                res = self._score_one(d)
+            except Exception:
+                res = None
+            if not res:
+                continue
+            rows.append({
+                "代號": info["代號"], "名稱": info["名稱"], "市場": info["市場"],
+                "收盤": info["收盤"],
+                "漲跌幅(%)": round(float(info["漲跌幅(%)"]), 2) if pd.notna(info["漲跌幅(%)"]) else None,
+                "成交金額(億)": round(float(info["成交金額(億)"]), 2),
+                **res,
+            })
+        if not rows:
+            return pd.DataFrame(), "候選股票皆無足夠歷史資料。" + self._status_suffix()
+        df = pd.DataFrame(rows)
+        total = len(df)
+        df = df[df["技術分數"] >= float(min_score)].sort_values(["技術分數", "20日報酬(%)"], ascending=False)
+        df.insert(0, "排名", range(1, len(df) + 1))
+        msg = (f"完成全市場選股：成交金額前 {len(cand)} 檔中，{total} 檔完成評分，"
+               f"{len(df)} 檔達 {min_score:g} 分以上。" + self._status_suffix())
+        return df.reset_index(drop=True), msg
