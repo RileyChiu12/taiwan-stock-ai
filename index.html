@@ -87,7 +87,7 @@ function md(text){
 }
 
 function table(data){if(!data||!data.length)return '<p class="small">沒有資料</p>';const cols=Object.keys(data[0]);return '<div class="table-wrap"><table><thead><tr>'+cols.map(c=>`<th>${esc(c)}</th>`).join('')+'</tr></thead><tbody>'+data.map(r=>'<tr>'+cols.map(c=>`<td>${esc(r[c])}</td>`).join('')+'</tr>').join('')+'</tbody></table></div>'}
-const API_BASE = " ";
+const API_BASE = "https://taiwan-stock-ai-y4g9.onrender.com";
 async function api(url,opt){
   const target = url.startsWith("http") ? url : API_BASE + url;
   const r = await fetch(target,opt);
