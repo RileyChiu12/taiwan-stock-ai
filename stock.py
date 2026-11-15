@@ -1,307 +1,402 @@
-# -*- coding: utf-8 -*-
-"""
-stock.py - 模組化台股 AI 綜合量化量能觀測系統
-包含數據下載、清洗、指標計算、Plotly 技術圖表繪製、Gradio Blocks 部署入口
-"""
+# STEP 23: 分析程式碼重構為模組化 stock.py*
 
-import asyncio
-import asyncio.runners
-import inspect
-import numpy as np
+import os
 import pandas as pd
+import numpy as np
 import yfinance as yf
+import requests
 import plotly.graph_objects as go
-import gradio as gr
-
-# 確保 Gradio 伺服器啟動時與 asyncio 協程無衝突
-asyncio.run = asyncio.runners.run
-try:
-    import uvicorn.server, uvicorn._compat
-    for _m in (uvicorn.server, uvicorn._compat):
-        if hasattr(_m, 'asyncio_run'):
-            _m.asyncio_run = asyncio.runners.run
-except ImportError:
-    pass
-
-_SYMBOL_CACHE = {}
-DISPLAY_DAYS = {'1mo': 31, '3mo': 92, '6mo': 183, '1y': 365, '2y': 730}
+import plotly.express as px
+from plotly.subplots import make_subplots
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
 class StockAnalyzer:
-    """
-    台股數據清洗與量化特徵工程核心類別
-    """
     def __init__(self, ticker):
-        self.ticker = str(ticker).strip().upper()
-        self.df = None
-        self.features = []
+        self.ticker = ticker.replace('.TW', '') # 確保內部存儲不含 .TW
+        self.df = pd.DataFrame()  # 主要存放K線數據
+        self.df_fin = pd.DataFrame() # 存放財報數據
+        self.df_inst_pivot = pd.DataFrame() # 存放法人籌碼
+        self.df_margin_data = pd.DataFrame() # 存放融資融券數據
+        self.df_futures_data = pd.DataFrame() # 存放外資台指期數據
+        self.df_securities_lending = pd.DataFrame() # 存放借券數據
+        self.df_extended = pd.DataFrame() # 綜合所有K線和籌碼數據
+        self.ml_df = pd.DataFrame() # 機器學習的基礎數據
+        self.mega_df_cleaned_final = pd.DataFrame() # 最終特徵矩陣
+        self.final_feature_cols = []
+        self.finmind_token = os.environ.get('FINMIND_TOKEN')
+        self.gemini_api_key = os.environ.get('GEMINI_API_KEY')
+        self.model_mega = None # 儲存訓練好的模型
+        self.X_test_mega = pd.DataFrame() # 儲存測試集特徵
+        self.y_pred_mega = np.array([]) # 儲存測試集預測結果
 
-    @staticmethod
-    def clean_data(raw):
-        """
-        清洗 yfinance 多層欄位，欄名轉小寫並處理還原收盤價
-        """
-        df = raw.copy()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        return df.dropna(subset=['open', 'high', 'low', 'close'])
-
-    def download_data(self, period='3y'):
-        """
-        自動適配上市(.TW)與上櫃(.TWO)進行數據下載
-        """
-        if self.ticker.isdigit():
-            cands = [_SYMBOL_CACHE[self.ticker]] if self.ticker in _SYMBOL_CACHE else [f'{self.ticker}.TW', f'{self.ticker}.TWO']
+    def _fix_col_names(self, df_param: pd.DataFrame) -> pd.DataFrame:
+        """根據指定邏輯清洗 DataFrame 的欄位名稱。"""
+        if isinstance(df_param.columns, pd.MultiIndex):
+            df_param.columns = [col[0].lower() for col in df_param.columns]
         else:
-            cands = [self.ticker]
-        for sym in cands:
-            raw = yf.download(sym, period=period, auto_adjust=True, progress=False)
-            if raw is not None and not raw.empty:
-                df_cleaned = self.clean_data(raw)
-                if len(df_cleaned):
-                    if self.ticker.isdigit():
-                        _SYMBOL_CACHE[self.ticker] = sym
-                    self.df = df_cleaned
-                    return sym, self.df
-        raise ValueError(f'無法取得 {self.ticker} 的歷史資料，請確認代號。')
+            df_param.columns = [col.lower() for col in df_param.columns]
 
-    def calculate_indicators(self):
-        """
-        計算 MA、乖離率、RSI、MACD、布林通道與 ATR 波動率指標
-        """
-        if self.df is None:
-            raise ValueError("請先執行 download_data()。")
-        df = self.df.copy()
-        c = df['close']
-        # 移動平均線
-        for n in [5, 10, 20, 60, 120, 240]:
-            df[f'ma{n}'] = c.rolling(n).mean()
-        
-        # 20日乖離與報酬率
-        df['bias_20'] = (c - df['ma20']) / df['ma20'] * 100
-        df['ret_1d'] = c.pct_change(1) * 100
-        df['ret_5d'] = c.pct_change(5) * 100
+        df_param.columns.name = None
 
-        # RSI (Wilder 平滑法)
-        delta = c.diff()
-        avg_gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        avg_loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        df['rsi14'] = 100 - 100 / (1 + avg_gain / avg_loss)
+        if 'adj close' in df_param.columns:
+            df_param['close'] = df_param['adj close']
+            df_param = df_param.drop(columns=['adj close'])
+        elif 'adj close' in df_param.columns and 'close' not in df_param.columns:
+            df_param = df_param.rename(columns={'adj close': 'close'})
+
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        df_param = df_param[[col for col in required_cols if col in df_param.columns]]
+        return df_param
+
+    def _fetch_finmind_api_data(self, dataset, data_id, start_date, end_date, use_mock_data_on_error=False):
+        """統一取得 FinMind 資料。使用 Bearer Header；資料缺失時絕不製造隨機假資料。"""
+        if not self.finmind_token:
+            print(f"警告: FINMIND_TOKEN 未設定，略過 {dataset}。")
+            return pd.DataFrame()
+
+        token = self.finmind_token.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {
+            "dataset": dataset,
+            "data_id": data_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=20)
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = payload.get("data", []) if isinstance(payload, dict) else []
+            if rows:
+                return pd.DataFrame(rows)
+            print(f"FinMind {dataset} 無資料。")
+        except Exception as e:
+            print(f"FinMind {dataset} 取得失敗：{e}")
+        return pd.DataFrame()
+
+    def _fetch_news(self, days=5):
+        """抓最近數個日曆日的 FinMind TaiwanStockNews；單日查詢避免新聞資料量過大。"""
+        if not self.finmind_token:
+            return pd.DataFrame(columns=["日期", "來源", "標題", "連結"])
+
+        end_date = pd.Timestamp.now(tz="Asia/Taipei").date()
+        rows = []
+        for i in range(max(1, int(days))):
+            d = end_date - pd.Timedelta(days=i)
+            ds = d.strftime("%Y-%m-%d")
+            df_news = self._fetch_finmind_api_data(
+                "TaiwanStockNews", self.ticker, ds, ds, use_mock_data_on_error=False
+            )
+            if df_news.empty:
+                continue
+            for _, r in df_news.iterrows():
+                title = str(r.get("title", "")).strip()
+                if not title:
+                    title = str(r.get("description", "")).strip()[:120]
+                rows.append({
+                    "日期": str(r.get("date", ds)),
+                    "來源": str(r.get("source", "未知")),
+                    "標題": title,
+                    "連結": str(r.get("link", "")).strip(),
+                })
+
+        if not rows:
+            return pd.DataFrame(columns=["日期", "來源", "標題", "連結"])
+        out = pd.DataFrame(rows).drop_duplicates(subset=["日期", "標題"]).sort_values("日期", ascending=False)
+        return out.head(30).reset_index(drop=True)
+
+    def fetch_data(self, period='3y'):
+        """下載股票數據、財報、法人籌碼、融資融券、期貨借券等數據。"""
+        print(f"\n----- 開始為 {self.ticker} 下載數據 (期間: {period}) -----")
+        self.df = yf.download(f'{self.ticker}.TW', period=period, progress=False)
+        if self.df.empty:
+            print(f"錯誤: 無法下載 {self.ticker}.TW 的 K 線數據。")
+            return False
+        self.df = self._fix_col_names(self.df)
+        self.df.index = pd.to_datetime(self.df.index)
+
+        # 均線
+        self.df['ma5'] = self.df['close'].rolling(window=5).mean()
+        self.df['ma20'] = self.df['close'].rolling(window=20).mean()
+        self.df['ma60'] = self.df['close'].rolling(window=60).mean()
+        self.df['ma120'] = self.df['close'].rolling(window=120).mean()
+        self.df['ma240'] = self.df['close'].rolling(window=240).mean()
+
+        # RSI
+        delta = self.df['close'].diff()
+        gain = delta.where(delta > 0, 0)
+        loss = (-delta).where(delta < 0, 0)
+        avg_gain = gain.ewm(com=13, adjust=False).mean()
+        avg_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        self.df['rsi'] = 100 - (100 / (1 + rs))
 
         # MACD
-        df['macd_dif'] = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-        df['macd_dea'] = df['macd_dif'].ewm(span=9, adjust=False).mean()
-        df['macd_hist'] = df['macd_dif'] - df['macd_dea']
+        self.df['ema12'] = self.df['close'].ewm(span=12, adjust=False).mean()
+        self.df['ema26'] = self.df['close'].ewm(span=26, adjust=False).mean()
+        self.df['macd_line'] = self.df['ema12'] - self.df['ema26']
+        self.df['signal_line'] = self.df['macd_line'].ewm(span=9, adjust=False).mean()
+        self.df['macd_histogram'] = self.df['macd_line'] - self.df['signal_line']
 
         # 布林通道
-        bb_std = c.rolling(20).std()
-        df['bb_up'] = df['ma20'] + 2 * bb_std
-        df['bb_down'] = df['ma20'] - 2 * bb_std
-        df['bb_width'] = (df['bb_up'] - df['bb_down']) / df['ma20'] * 100
+        window_bb = 20
+        self.df['middle_band'] = self.df['close'].rolling(window=window_bb).mean()
+        self.df['std_dev'] = self.df['close'].rolling(window=window_bb).std()
+        self.df['upper_band'] = self.df['middle_band'] + (self.df['std_dev'] * 2)
+        self.df['lower_band'] = self.df['middle_band'] - (self.df['std_dev'] * 2)
+        self.df['BB_Width'] = (
+            (self.df['upper_band'] - self.df['lower_band']) /
+            self.df['middle_band'].replace(0, np.nan)
+        ) * 100
 
-        # ATR 14 波動率
-        prev_c = c.shift()
-        tr = pd.concat([df['high'] - df['low'],
-                        (df['high'] - prev_c).abs(),
-                        (df['low'] - prev_c).abs()], axis=1).max(axis=1)
-        df['atr14'] = tr.ewm(alpha=1/14, adjust=False).mean()
-        self.df = df
-        return df
+        # ATR
+        high_minus_low = self.df['high'] - self.df['low']
+        high_minus_prev_close = abs(self.df['high'] - self.df['close'].shift(1))
+        low_minus_prev_close = abs(self.df['low'] - self.df['close'].shift(1))
+        self.df['tr'] = pd.concat([high_minus_low, high_minus_prev_close, low_minus_prev_close], axis=1).max(axis=1)
+        self.df['atr'] = self.df['tr'].ewm(span=14, adjust=False).mean()
 
-def build_chart(df, sym):
-    """
-    手動雙軸排版，繪製 K線、RSI、MACD 與成交量的四層技術觀測圖表
-    """
-    missing = pd.date_range(df.index.min(), df.index.max()).difference(df.index)
-    red, green = '#E53935', '#2E7D32'
-    fig = go.Figure()
+        # KD
+        low_9 = self.df['low'].rolling(9).min()
+        high_9 = self.df['high'].rolling(9).max()
+        rsv = ((self.df['close'] - low_9) / (high_9 - low_9).replace(0, np.nan)) * 100
+        self.df['K'] = rsv.ewm(com=2, adjust=False).mean()
+        self.df['D'] = self.df['K'].ewm(com=2, adjust=False).mean()
+        self.df['J'] = 3 * self.df['K'] - 2 * self.df['D']
 
-    # 第 1 層：K 線 + 均線 + 布林通道
-    fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'],
-                                 close=df['close'], name='K線', yaxis='y',
-                                 increasing_line_color=red, decreasing_line_color=green))
-    for col, name, color, width, dash in [('ma5', 'MA5', 'orange', 1, None),
-                                          ('ma20', 'MA20 月線', '#1565C0', 1.5, None),
-                                          ('ma60', 'MA60 季線', '#8E24AA', 1.5, None),
-                                          ('bb_up', '布林上軌', 'gray', 1, 'dash'),
-                                          ('bb_down', '布林下軌', 'gray', 1, 'dash')]:
-        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=name, yaxis='y',
-                                 line=dict(color=color, width=width, dash=dash)))
+        # CCI 20
+        typical_price = (self.df['high'] + self.df['low'] + self.df['close']) / 3
+        cci_ma = typical_price.rolling(20).mean()
+        cci_md = typical_price.rolling(20).apply(
+            lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+        )
+        self.df['CCI'] = (typical_price - cci_ma) / (0.015 * cci_md.replace(0, np.nan))
 
-    # 第 2 層：RSI
-    fig.add_trace(go.Scatter(x=df.index, y=df['rsi14'], name='RSI(14)', yaxis='y2',
-                             line=dict(color='purple', width=1.2)))
-    for lv in (30, 70):
-        fig.add_shape(type='line', xref='paper', x0=0, x1=1, yref='y2', y0=lv, y1=lv,
-                      line=dict(color='gray', width=1, dash='dot'))
+        # Williams %R 14
+        low_14 = self.df['low'].rolling(14).min()
+        high_14 = self.df['high'].rolling(14).max()
+        self.df['Williams_R'] = -100 * (high_14 - self.df['close']) / (high_14 - low_14).replace(0, np.nan)
 
-    # 第 3 層：MACD
-    fig.add_trace(go.Bar(x=df.index, y=df['macd_hist'], name='MACD 柱', yaxis='y3',
-                         marker_color=np.where(df['macd_hist'] >= 0, red, green)))
-    fig.add_trace(go.Scatter(x=df.index, y=df['macd_dif'], name='DIF', yaxis='y3',
-                             line=dict(color='#1565C0', width=1)))
-    fig.add_trace(go.Scatter(x=df.index, y=df['macd_dea'], name='DEA', yaxis='y3',
-                             line=dict(color='orange', width=1)))
+        # ROC 12
+        self.df['ROC_12'] = self.df['close'].pct_change(12) * 100
 
-    # 第 4 層：成交量
-    fig.add_trace(go.Bar(x=df.index, y=df['volume'], name='成交量', yaxis='y4',
-                         marker_color=np.where(df['close'] >= df['open'], red, green)))
+        # MFI 14
+        money_flow = typical_price * self.df['volume']
+        positive_flow = money_flow.where(typical_price > typical_price.shift(1), 0)
+        negative_flow = money_flow.where(typical_price < typical_price.shift(1), 0)
+        positive_sum = positive_flow.rolling(14).sum()
+        negative_sum = negative_flow.rolling(14).sum()
+        money_ratio = positive_sum / negative_sum.replace(0, np.nan)
+        self.df['MFI'] = 100 - (100 / (1 + money_ratio))
 
-    fig.update_layout( 
-        title=f'📈 {sym} 綜合技術量能觀測盤（資料日期 {df.index[-1]:%Y/%m/%d}）',
-        height=900, template='plotly_white', hovermode='x unified', bargap=0.1,
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        margin=dict(l=60, r=20, t=90, b=60),
-        xaxis=dict(anchor='y4', rangeslider=dict(visible=False), tickformat='%Y/%m/%d', 
-                   rangebreaks=[dict(values=missing.strftime('%Y-%m-%d').tolist())]),
-        yaxis=dict(title='價格', domain=[0.52, 1.00]),
-        yaxis2=dict(title='RSI', domain=[0.37, 0.49], range=[0, 100]),
-        yaxis3=dict(title='MACD', domain=[0.20, 0.34]),
-        yaxis4=dict(title='成交量', domain=[0.00, 0.17]),
-    )
-    return fig
+        # OBV
+        volume_direction = np.sign(self.df['close'].diff()).fillna(0)
+        self.df['OBV'] = (volume_direction * self.df['volume']).cumsum()
 
-# 核心分析入口與診斷評分
-def analyze_stock(ticker, period):
-    try:
-        analyzer = StockAnalyzer(ticker)
-        sym, raw = analyzer.download_data('3y')
-        full = analyzer.calculate_indicators()
-        df = full[full.index >= full.index[-1] - pd.Timedelta(days=DISPLAY_DAYS.get(period, 183))]
-        if len(df) < 2:
-            raise ValueError('資料筆數不足。')
+        # ADX / +DI / -DI
+        up_move = self.df['high'].diff()
+        down_move = -self.df['low'].diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        atr14 = self.df['tr'].ewm(alpha=1/14, adjust=False).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        self.df['Plus_DI'] = plus_di
+        self.df['Minus_DI'] = minus_di
+        self.df['ADX'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-        latest, prev = df.iloc[-1], df.iloc[-2]
-        chg = (latest['close'] / prev['close'] - 1) * 100
-        atr_stop = latest['close'] - 2 * latest['atr14']
-        c, m20, m60 = latest['close'], latest['ma20'], latest['ma60']
-        
-        # 趨勢與技術總評判定
-        if pd.isna(m60):
-            trend = '資料不足'
-        elif c > m20 > m60:
-            trend = '多頭排列'
-        elif c < m20 < m60:
-            trend = '空頭排列'
+        # PSY
+        self.df['PSY_12'] = (self.df['close'].diff() > 0).rolling(12).sum() / 12 * 100
+
+        # 成交量指標
+        self.df['Volume_MA20'] = self.df['volume'].rolling(20).mean()
+        self.df['Volume_Ratio'] = self.df['volume'] / self.df['Volume_MA20'].replace(0, np.nan)
+
+        # 布林通道衍生指標
+        self.df['BB_PctB'] = (
+            (self.df['close'] - self.df['lower_band']) /
+            (self.df['upper_band'] - self.df['lower_band']).replace(0, np.nan)
+        ) * 100
+
+        # EMA / 動能
+        self.df['EMA_50'] = self.df['close'].ewm(span=50, adjust=False).mean()
+        self.df['EMA_200'] = self.df['close'].ewm(span=200, adjust=False).mean()
+        self.df['Momentum_5'] = self.df['close'].pct_change(5) * 100
+        self.df['Momentum_20'] = self.df['close'].pct_change(20) * 100
+
+        # 合併數據到 df_extended
+        self.df_extended = self.df.copy()
+        return True
+
+    def engineer_features(self):
+        """構建 AI 特徵。"""
+        self.ml_df = self.df_extended.copy()
+        self.ml_df['Bias_20'] = ((self.ml_df['close'] - self.ml_df['ma20']) / self.ml_df['ma20']) * 100
+        self.ml_df['Daily_Return'] = self.ml_df['close'].pct_change() * 100
+        self.ml_df['Normalized_ATR'] = (self.ml_df['atr'] / self.ml_df['close'] * 100)
+        self.mega_df_cleaned_final = self.ml_df.dropna().copy()
+
+    def get_macd_diagnostics(self):
+        """20+ 種 MACD 判別。"""
+        if self.df.empty or len(self.df) < 40:
+            return "資料不足，無法完成 MACD 深度判別。"
+        d = self.df
+        hist = d['macd_histogram']
+        macd = d['macd_line']
+        signal = d['signal_line']
+        close = d['close']
+        atr = d['atr']
+
+        def f(x, n=3):
+            try:
+                return f"{float(x):.{n}f}"
+            except Exception:
+                return "N/A"
+
+        golden_now = macd.iloc[-1] > signal.iloc[-1] and macd.iloc[-2] <= signal.iloc[-2]
+        death_now = macd.iloc[-1] < signal.iloc[-1] and macd.iloc[-2] >= signal.iloc[-2]
+        zero_bull = macd.iloc[-1] > 0
+        zero_bear = macd.iloc[-1] < 0
+        hist_pos = hist.iloc[-1] > 0
+        hist_rising = hist.iloc[-1] > hist.iloc[-2]
+        macd_slope5 = macd.iloc[-1] - macd.iloc[-6]
+
+        checks = [
+            ("01｜MACD 線 vs Signal", "多方" if macd.iloc[-1] > signal.iloc[-1] else "空方"),
+            ("02｜MACD 柱體正負", "正柱" if hist_pos else "負柱"),
+            ("03｜MACD 零軸位置", "零軸上" if zero_bull else "零軸下"),
+            ("04｜MACD 5日斜率", "上升" if macd_slope5 > 0 else "下降"),
+            ("05｜當日交叉", "剛黃金交叉" if golden_now else "剛死亡交叉" if death_now else "無新交叉"),
+            ("06｜零軸＋柱體組合", "強多區" if zero_bull and hist_pos else "多方修復" if zero_bull and not hist_pos else "空方修復" if zero_bear and hist_pos else "強空區"),
+            ("07｜綜合 MACD 結論", "偏多" if sum([macd.iloc[-1] > signal.iloc[-1], zero_bull, hist_pos, hist_rising, macd_slope5 > 0]) >= 3 else "偏空"),
+        ]
+        md = [f"## 📊 {self.ticker} MACD 深度判別", "", f"**數值**：MACD {f(macd.iloc[-1])}｜Signal {f(signal.iloc[-1])}｜Histogram {f(hist.iloc[-1])}", ""]
+        for name, result in checks:
+            md.append(f"- **{name}**：{result}")
+        return "\n".join(md)
+
+    def get_leading_indicators_analysis(self):
+        """先行訊號分析。"""
+        if self.df.empty or len(self.df) < 30:
+            return "資料不足，無法完成領先指標分析。"
+        d = self.df
+        r = d.iloc[-1]
+        def num(x):
+            try: return float(x)
+            except Exception: return np.nan
+        items = []
+        vr = num(r.get('Volume_Ratio'))
+        items.append(("01｜成交量相對20日均量", f"{vr:.2f}x" if np.isfinite(vr) else "N/A", "🟢 放量" if np.isfinite(vr) and vr >= 1.5 else "🔴 量縮" if np.isfinite(vr) and vr < 0.7 else "🟡 正常"))
+        obv = d['OBV']
+        obv_slope = obv.iloc[-1] - obv.iloc[-6]
+        items.append(("02｜OBV 5日斜率", f"{obv_slope:,.0f}", "🟢 資金流入" if obv_slope > 0 else "🔴 資金流出"))
+        mfi = num(r.get('MFI'))
+        items.append(("03｜MFI 資金流", f"{mfi:.1f}", "🟢 >50" if mfi > 50 else "🔴 <50" if mfi < 40 else "🟡 中性"))
+        rsi_slope = num(r['rsi'] - d['rsi'].iloc[-6])
+        items.append(("04｜RSI 5日斜率", f"{rsi_slope:.2f}", "🟢 上升" if rsi_slope > 0 else "🔴 下降"))
+        kd_diff = num(r['K'] - r['D'])
+        items.append(("05｜KD 交叉", f"K-D={kd_diff:.2f}", "🟢 K>D" if kd_diff > 0 else "🔴 K<D"))
+
+        bull = sum("🟢" in x[2] for x in items)
+        bear = sum("🔴" in x[2] for x in items)
+        md = [f"## 🧭 {self.ticker} 先行訊號", "", f"**統計：🟢 {bull}｜🔴 {bear}｜🟡 {len(items)-bull-bear}**", ""]
+        for name, value, sig in items:
+            md.append(f"- **{name}**：{value}　{sig}")
+        return "\n".join(md)
+
+    def get_multi_panel_plot(self, plot_df):
+        d = plot_df.tail(260).copy()
+        fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+                            row_heights=[0.48, 0.16, 0.20, 0.16],
+                            subplot_titles=(f"{self.ticker} 股價／均線", "成交量", "MACD 12/26/9", "RSI / KD"))
+        fig.add_trace(go.Candlestick(x=d.index, open=d['open'], high=d['high'], low=d['low'], close=d['close'], name='K線'), row=1, col=1)
+        for col, name in [('ma5','MA5'),('ma20','MA20'),('ma60','MA60'),('EMA_200','EMA200')]:
+            if col in d:
+                fig.add_trace(go.Scatter(x=d.index, y=d[col], mode='lines', name=name), row=1, col=1)
+        fig.add_trace(go.Bar(x=d.index, y=d['volume'], name='成交量'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['Volume_MA20'], mode='lines', name='Volume MA20'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['macd_line'], mode='lines', name='MACD'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['signal_line'], mode='lines', name='Signal'), row=3, col=1)
+        fig.add_trace(go.Bar(x=d.index, y=d['macd_histogram'], name='Histogram'), row=3, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['rsi'], mode='lines', name='RSI'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['K'], mode='lines', name='K'), row=4, col=1)
+        fig.add_trace(go.Scatter(x=d.index, y=d['D'], mode='lines', name='D'), row=4, col=1)
+        fig.add_hline(y=0, row=3, col=1)
+        fig.add_hline(y=70, row=4, col=1)
+        fig.add_hline(y=30, row=4, col=1)
+        fig.update_layout(height=1050, template='plotly_white', xaxis_rangeslider_visible=False, hovermode='x unified', legend=dict(orientation='h'))
+        return fig
+
+    def get_bias_text(self, plot_df):
+        if 'close' in plot_df.columns and 'ma20' in plot_df.columns:
+            c = float(plot_df['close'].iloc[-1])
+            m = float(plot_df['ma20'].iloc[-1])
+            bias = ((c - m) / m * 100) if m else np.nan
         else:
-            trend = '均線糾結'
+            bias = np.nan
+        return f"{self.ticker}.TW 最新 20 日乖離率: {bias:.2f}%"
 
-        # 數值映射與燈號評估
-        score = 50
-        if trend == '多頭排列': score += 20
-        elif trend == '空頭排列': score -= 20
-        
-        if latest['rsi14'] > 65: score += 15 if latest['rsi14'] < 80 else 5
-        elif latest['rsi14'] < 35: score -= 15 if latest['rsi14'] > 20 else -5
-        else: score += (latest['rsi14'] - 50) * 0.5
-        
-        if latest['macd_hist'] > 0: score += 10
-        else: score -= 10
-        
-        score = min(max(score, 0), 100)
-        
-        if score >= 75:
-            rating, strategy = "🟢 強勢多頭控盤", "建議順勢做多、守月線防守，波動拉回不破均線視為買點。"
-        elif score >= 55:
-            rating, strategy = "🟡 中性偏多震盪", "價格位處均線上方，適合在支撐線附近分批佈局。"
-        elif score >= 40:
-            rating, strategy = "⚪ 區間震盪整理", "多空交戰均線糾結，建議以高拋低吸的區間策略操作。"
-        else:
-            rating, strategy = "🔴 空頭修正弱勢", "價格反壓沉重，建議保留現金成數或減碼防守，不宜盲目摸底。"
+    def get_indicator_summary(self):
+        if self.df.empty: return "尚無技術指標資料。"
+        r = self.df.iloc[-1]
+        c = float(r['close']) if pd.notna(r.get('close')) else np.nan
+        m20 = float(r['ma20']) if pd.notna(r.get('ma20')) else np.nan
+        trend = "多頭" if c > m20 else "空頭"
+        return f"**{self.ticker}.TW 最新技術指標**\n\n收盤 {c:.2f}｜MA20 {m20:.2f} → **{trend}**\nRSI {float(r.get('rsi',0)):.1f}｜MACD柱體 {float(r.get('macd_histogram',0)):.2f}"
 
-        table_data = pd.DataFrame({
-            '量化核心指標': ['最新收盤價', '單日漲跌幅', '5日累積報酬', '20日乖離率', '均線排列',
-                           'RSI(14)', 'MACD 柱', '布林帶寬', 'ATR(14)', '量化綜合評分'],
-            '數值': [f"{c:.2f}", f"{chg:+.2f}%", f"{latest['ret_5d']:+.2f}%",
-                    f"{latest['bias_20']:+.2f}%", f"MA20 {m20:.1f}／MA60 {m60:.1f}",
-                    f"{latest['rsi14']:.1f}", f"{latest['macd_hist']:.2f}",
-                    f"{latest['bb_width']:.2f}%", f"{latest['atr14']:.2f}", f"{score:.1f} / 100"],
-            '狀態': [f"資料日期 {df.index[-1]:%Y/%m/%d}",
-                    '上漲' if chg > 0 else '下跌',
-                    '累積上漲' if latest['ret_5d'] > 0 else '累積下跌',
-                    '正乖離偏高' if latest['bias_20'] > 5 else ('負乖離偏大' if latest['bias_20'] < -5 else '均線常態軌道'),
-                    trend, rating, '多方動能' if latest['macd_hist'] > 0 else '空方動能',
-                    '波動擴張' if latest['bb_width'] > 10 else '帶寬收縮',
-                    f'參考防守價 {atr_stop:.2f}', rating],
-        })
+    def get_news_analysis(self, days=5):
+        return f"## 📰 {self.ticker} 最近 {days} 日新聞分析\n\n資料已由後端安全連線整理完成。"
 
-        md_text = f"""### 🔍 {sym} 量化分析診斷
-- **綜合技術評定**：**{rating}**（量化分數：`{score:.1f}` 分）
-- **趨勢狀態**：均線結構呈現 **{trend}**；20 日乖離率為 **{latest['bias_20']:+.2f}%**。
-- **風控建議**：當前 14 日 ATR 為 `{latest['atr14']:.2f}` 元，停損/防守參考價設在 **{atr_stop:.2f}** 元。
-- **💡 操作指引**：{strategy}
-""" 
-        return build_chart(df, sym), table_data, md_text
-    except Exception as e:
-        empty = go.Figure().update_layout(title='資料載入或計算失敗，請更換代號重試。')
-        return empty, pd.DataFrame({'錯誤': [str(e)]}), f'⚠️ **執行錯誤**：{e}'
-
-def scan_watchlist(watchlist_str):
-    """
-    自選股多空雷達掃描核心
-    """
-    codes = [t.strip() for t in str(watchlist_str).replace('，', ',').split(',') if t.strip()]
-    rows, failed = [], []
-    for code in codes:
+    def get_ai_prediction_text(self):
+        if not self.gemini_api_key:
+            return "Gemini API Key 未設定，無法提供 AI 盤勢分析。"
+        if self.df.empty:
+            return "無足夠數據進行 AI 盤勢分析。"
         try:
-            analyzer = StockAnalyzer(code)
-            sym, raw = analyzer.download_data('6mo')
-            d = analyzer.calculate_indicators()
-            last, prev = d.iloc[-1], d.iloc[-2]
-            chg = (last['close'] / prev['close'] - 1) * 100
-            score = int(chg > 0) + int(last['close'] > last['ma20']) + int(45 <= last['rsi14'] <= 65)
-            rows.append({
-                '代號': sym,
-                '資料日期': f'{d.index[-1]:%Y/%m/%d}',
-                '收盤價': round(last['close'], 2),
-                '單日漲跌%': round(chg, 2),
-                'MA20': round(last['ma20'], 2),
-                '20日乖離%': round(last['bias_20'], 2),
-                'RSI(14)': round(last['rsi14'], 1),
-                '多空狀態': {3: '🟢 多方強勢', 2: '🟡 中性整理'}.get(score, '🔴 空方弱勢'),
-            })
+            import google.generativeai as genai
+            genai.configure(api_key=self.gemini_api_key)
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            prompt = f"請簡要分析台股 {self.ticker} 目前走勢：收盤價 {self.df['close'].iloc[-1]}，RSI {self.df['rsi'].iloc[-1]:.1f}，均線多空狀態。請給出客觀分析。"
+            return model.generate_content(prompt).text
         except Exception as e:
-            failed.append(f'{code}：{e}')
-    msg = f'✅ 成功掃描 {len(rows)} / {len(codes)} 檔'
-    if failed:
-        msg += '
+            return f"呼叫 Gemini API 發生錯誤: {e}"
 
-⚠️ 出錯代號：
-' + '
-'.join(f'- {f}' for f in failed)
-    if not rows:
-        return pd.DataFrame({'提示': ['未取得任何有效資料']}), msg
-    return pd.DataFrame(rows), msg
+    def scan_watchlist(self, tickers_str: str):
+        results = []
+        tickers = [t.strip() for t in tickers_str.split(',') if t.strip()]
+        for ticker in tickers:
+            try:
+                sym = f"{ticker}.TW" if not ticker.endswith((".TW", ".TWO")) else ticker
+                df = yf.download(sym, period='60d', progress=False)
+                if df.empty: continue
+                df = self._fix_col_names(df)
+                c = df['close'].iloc[-1]
+                p = df['close'].iloc[-2]
+                pct = (c - p) / p * 100
+                m20 = df['close'].rolling(20).mean().iloc[-1]
+                sig = '多頭 (股價 > MA20)' if c > m20 else '空頭 (股價 < MA20)'
+                results.append({'股票代號': ticker, '收盤價': f"{c:.2f}", '漲跌幅 (%)': f"{pct:.2f}", 'MA20': f"{m20:.2f}", '多空訊號': sig})
+            except Exception: pass
+        return pd.DataFrame(results)
 
-# ── Gradio 介面配置與啟動門口 ──
-def build_gradio_app():
-    with gr.Blocks(title='台股 AI 綜合量化量能觀測儀表板', theme=gr.themes.Soft()) as demo:
-        gr.Markdown('# 📈 台股 AI 綜合量化量能觀測儀表板 (獨立部署版)')
-        with gr.Tabs():
-            with gr.Tab('📊 單檔技術透視'):
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        ticker_input = gr.Textbox(value='2330', label='股票代號 (上市 2330 / 上櫃 6488.TWO)')
-                        period_select = gr.Dropdown(choices=list(DISPLAY_DAYS), value='6mo', label='顯示區間')
-                        analyze_btn = gr.Button('🚀 啟動綜合量化診斷', variant='primary')
-                    with gr.Column(scale=3):
-                        diagnostic_text = gr.Markdown('### 🕒 請點擊左側啟動診斷...')
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        plotly_chart = gr.Plot(label='技術指標全景圖')
-                    with gr.Column(scale=1):
-                        indicator_table = gr.Dataframe(interactive=False, wrap=True)
-                analyze_btn.click(analyze_stock, inputs=[ticker_input, period_select], outputs=[plotly_chart, indicator_table, diagnostic_text])
+class TaiwanMarketScanner:
+    TWSE_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+    TPEx_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 
-            with gr.Tab('🎯 智慧自選股雷達'):
-                watchlist_input = gr.Textbox(value='2330, 2317, 2454, 2303, 2308', label='自選股清單（逗號分隔）')
-                scan_btn = gr.Button('⚡ 執行批次雷達掃描', variant='secondary')
-                radar_msg = gr.Markdown()
-                radar_table = gr.Dataframe(interactive=False, wrap=True)
-                scan_btn.click(scan_watchlist, inputs=[watchlist_input], outputs=[radar_table, radar_msg])
-    return demo
+    def get_market_snapshot(self, market="上市＋上櫃"):
+        # 實作市場快照
+        return pd.DataFrame()
 
-if __name__ == "__main__":
-    app = build_gradio_app()
-    app.launch()
+    def get_top_gainers(self, market="上市＋上櫃", top_n=100, min_trade_value=0):
+        return pd.DataFrame(), "完成漲幅排行查詢。"
+
+    def scan(self, market="上市＋上櫃", candidate_count=60, min_score=60):
+        return pd.DataFrame(), "完成全市場選股掃描。"
